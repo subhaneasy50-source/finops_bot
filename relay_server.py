@@ -1,197 +1,140 @@
-# relay_server.py — 24/7 relay between your bot (laptop) and the dashboard.
-# Deploy this on Render (or Railway) as a free Web Service.
+# relay_server.py — Flask version for PythonAnywhere (free tier, no credit card,
+# no sleep/spin-down). Functionally identical to the FastAPI version, just
+# rewritten as WSGI since PythonAnywhere's free tier only supports Flask/Django.
 #
 # WHAT IT DOES
 #   - Your bot (master_bot.py + relay_sync.py) PUSHES its status here every ~15s.
 #   - The dashboard reads status from HERE, not from your laptop directly.
-#   - So the dashboard stays reachable 24/7 even when your laptop is off —
-#     it will just show "Bot Offline" plus the last data it received.
-#   - This server never logs into managment.io itself, so there's no geo-IP
-#     concern with the management portal at all.
+#   - Stays reachable 24/7 even when your laptop is off — shows "Bot Offline"
+#     plus the last data it received.
+#   - Never logs into managment.io itself, so there's no geo-IP concern there.
 #
-# ENV VARS TO SET ON RENDER
-#   FINOPS_PASSWORD   -> dashboard/operator login password (team uses this)
-#   RELAY_BOT_SECRET  -> a long random secret ONLY your bot knows (not the
-#                        same as the dashboard password!)
-#   DATABASE_URL      -> (optional but recommended) attach a free Render
-#                        Postgres and Render will inject this automatically.
-#                        Without it, state is kept in memory only and will
-#                        reset if this service sleeps/restarts.
-#
-# RUN LOCALLY (for testing): uvicorn relay_server:app --port 9000
+# SET THESE (edit directly in this file, or in your PythonAnywhere WSGI config
+# file before importing this module — free tier doesn't have an env-var UI):
+#   FINOPS_PASSWORD   -> dashboard/operator login password
+#   RELAY_BOT_SECRET  -> long random secret ONLY your bot knows
 
 import os
 import json
 import time
 import secrets
 import threading
-from fastapi import FastAPI, HTTPException, Header, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from flask import Flask, request, jsonify
 
 OPERATOR_PASSWORD = os.environ.get("FINOPS_PASSWORD", "Easylife786")
-BOT_PUSH_SECRET = os.environ.get("RELAY_BOT_SECRET", "")
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
+BOT_PUSH_SECRET = os.environ.get("RELAY_BOT_SECRET", "CHANGE-THIS-TO-A-LONG-RANDOM-SECRET")
 
-BOT_ONLINE_THRESHOLD_SECONDS = 90  # no push in 90s => dashboard shows "offline"
+BOT_ONLINE_THRESHOLD_SECONDS = 90
 
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
-)
+# State persists to a JSON file on PythonAnywhere's disk (which is NOT wiped
+# between requests, unlike Render/Koyeb free tiers) so last-known data
+# survives even long laptop-off periods.
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "relay_state.json")
 
-# ---------------------------------------------------------------------------
-# Persistence layer: Postgres if DATABASE_URL is set (survives sleep/restart),
-# otherwise an in-memory fallback (fine for local testing only).
-# ---------------------------------------------------------------------------
-_mem_lock = threading.Lock()
-_mem_snapshot: dict = {}
-_mem_last_seen: float = 0.0
+app = Flask(__name__)
 
-
-def _pg_conn():
-    import psycopg2
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
-
-
-def _init_db():
-    if not DATABASE_URL:
-        return
-    conn = _pg_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS bot_state (
-            id INT PRIMARY KEY,
-            snapshot TEXT NOT NULL,
-            last_seen DOUBLE PRECISION NOT NULL
-        )
-        """
-    )
-    cur.execute(
-        "INSERT INTO bot_state (id, snapshot, last_seen) VALUES (1, '{}', 0) "
-        "ON CONFLICT (id) DO NOTHING"
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-if DATABASE_URL:
-    _init_db()
-
-
-def save_snapshot(snapshot: dict):
-    now = time.time()
-    if DATABASE_URL:
-        conn = _pg_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE bot_state SET snapshot=%s, last_seen=%s WHERE id=1",
-            (json.dumps(snapshot), now),
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
-    else:
-        with _mem_lock:
-            global _mem_snapshot, _mem_last_seen
-            _mem_snapshot = snapshot
-            _mem_last_seen = now
-
-
-def load_snapshot() -> tuple[dict, float]:
-    if DATABASE_URL:
-        conn = _pg_conn()
-        cur = conn.cursor()
-        cur.execute("SELECT snapshot, last_seen FROM bot_state WHERE id=1")
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        if row:
-            return json.loads(row[0]), row[1]
-        return {}, 0.0
-    else:
-        with _mem_lock:
-            return dict(_mem_snapshot), _mem_last_seen
-
-
-# Command queue (dashboard -> bot). Kept in memory: if this service restarts
-# mid-command the operator just clicks the button again, which is fine.
-_cmd_lock = threading.Lock()
+_lock = threading.Lock()
 _commands: list = []
 
 
-# ---------------------------------------------------------------------------
-# Auth: two SEPARATE secrets.
-#   - OPERATOR_PASSWORD: humans logging into the dashboard.
-#   - BOT_PUSH_SECRET: only your bot uses this to push status / pull commands.
-# ---------------------------------------------------------------------------
+def _cors(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "*"
+    return resp
+
+
+@app.after_request
+def add_cors(resp):
+    return _cors(resp)
+
+
+@app.route("/api/<path:_any>", methods=["OPTIONS"])
+def cors_preflight(_any):
+    return _cors(app.make_default_options_response())
+
+
+def save_snapshot(snapshot: dict):
+    with _lock:
+        payload = {"snapshot": snapshot, "last_seen": time.time()}
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+
+def load_snapshot():
+    with _lock:
+        if not os.path.exists(STATE_FILE):
+            return {}, 0.0
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            return payload.get("snapshot", {}), payload.get("last_seen", 0.0)
+        except Exception:
+            return {}, 0.0
+
+
+# ---- auth ----
 TOKENS: dict = {}
 TOKEN_TTL_SECONDS = 12 * 60 * 60
-
 _FAILED_ATTEMPTS: dict = {}
 _MAX_ATTEMPTS = 5
 _WINDOW_SECONDS = 300
 
 
-def _check_throttle(key: str):
+def _check_throttle():
     now = time.time()
-    count, first_ts = _FAILED_ATTEMPTS.get(key, (0, now))
+    count, first_ts = _FAILED_ATTEMPTS.get("global", (0, now))
     if now - first_ts > _WINDOW_SECONDS:
         count, first_ts = 0, now
-    if count >= _MAX_ATTEMPTS:
-        raise HTTPException(429, "Too many failed attempts. Try again later.")
-    return count, first_ts
+    return count < _MAX_ATTEMPTS
 
 
-def _record_failure(key: str):
-    count, first_ts = _FAILED_ATTEMPTS.get(key, (0, time.time()))
-    _FAILED_ATTEMPTS[key] = (count + 1, first_ts)
+def _record_failure():
+    count, first_ts = _FAILED_ATTEMPTS.get("global", (0, time.time()))
+    _FAILED_ATTEMPTS["global"] = (count + 1, first_ts)
 
 
-def _clear_failures(key: str):
-    _FAILED_ATTEMPTS.pop(key, None)
+def _clear_failures():
+    _FAILED_ATTEMPTS.pop("global", None)
 
 
-def require_operator(authorization: str = Header(default="")):
-    tok = authorization.removeprefix("Bearer ").strip()
+def _operator_ok() -> bool:
+    tok = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
     expiry = TOKENS.get(tok)
     if expiry is None or expiry < time.time():
         TOKENS.pop(tok, None)
-        raise HTTPException(401, "Unauthorized")
+        return False
+    return True
 
 
-def require_bot(x_bot_secret: str = Header(default="")):
-    if not BOT_PUSH_SECRET or not secrets.compare_digest(x_bot_secret, BOT_PUSH_SECRET):
-        raise HTTPException(401, "Unauthorized bot")
+def _bot_ok() -> bool:
+    secret = request.headers.get("X-Bot-Secret", "")
+    return bool(BOT_PUSH_SECRET) and secrets.compare_digest(secret, BOT_PUSH_SECRET)
 
 
-# ---------------------------------------------------------------------------
-# Dashboard-facing endpoints
-# ---------------------------------------------------------------------------
-class LoginIn(BaseModel):
-    password: str
-
-
-@app.post("/api/login")
-def login(body: LoginIn):
-    key = "global"
-    _check_throttle(key)
-    if not secrets.compare_digest(body.password, OPERATOR_PASSWORD):
-        _record_failure(key)
-        raise HTTPException(401, "Invalid password")
-    _clear_failures(key)
+# ---- dashboard endpoints ----
+@app.route("/api/login", methods=["POST"])
+def login():
+    if not _check_throttle():
+        return jsonify({"detail": "Too many failed attempts. Try again later."}), 429
+    body = request.get_json(force=True, silent=True) or {}
+    password = body.get("password", "")
+    if not secrets.compare_digest(password, OPERATOR_PASSWORD):
+        _record_failure()
+        return jsonify({"detail": "Invalid password"}), 401
+    _clear_failures()
     tok = secrets.token_urlsafe(24)
     TOKENS[tok] = time.time() + TOKEN_TTL_SECONDS
-    return {"token": tok}
+    return jsonify({"token": tok})
 
 
-@app.get("/api/status", dependencies=[Depends(require_operator)])
+@app.route("/api/status", methods=["GET"])
 def status():
+    if not _operator_ok():
+        return jsonify({"detail": "Unauthorized"}), 401
     snap, last_seen = load_snapshot()
     online = (time.time() - last_seen) < BOT_ONLINE_THRESHOLD_SECONDS if last_seen else False
-    return {
+    return jsonify({
         "bot_online": online,
         "last_seen_seconds_ago": int(time.time() - last_seen) if last_seen else None,
         "internet_online": snap.get("internet_online", False),
@@ -199,69 +142,86 @@ def status():
         "approved_today": snap.get("approved_today", 0),
         "pending_withdrawals_total": snap.get("pending_withdrawals_total", "0k"),
         "success_rate": snap.get("success_rate", 0.0),
-    }
+    })
 
 
-@app.get("/api/logs", dependencies=[Depends(require_operator)])
+@app.route("/api/logs", methods=["GET"])
 def logs():
+    if not _operator_ok():
+        return jsonify({"detail": "Unauthorized"}), 401
     snap, _ = load_snapshot()
-    return {"logs": snap.get("logs", [])}
+    return jsonify({"logs": snap.get("logs", [])})
 
 
-@app.get("/api/pending", dependencies=[Depends(require_operator)])
+@app.route("/api/pending", methods=["GET"])
 def pending():
+    if not _operator_ok():
+        return jsonify({"detail": "Unauthorized"}), 401
     snap, _ = load_snapshot()
-    pending_map = snap.get("pending", {})
     now = time.time()
     items = []
-    for tid, r in pending_map.items():
+    for tid, r in snap.get("pending", {}).items():
         age_s = int(now - r.get("ts", now))
         age = f"{age_s // 60}m {age_s % 60:02d}s" if age_s >= 60 else f"{age_s}s"
         items.append({"tid": tid, "amount": r.get("amount"), "status": r.get("status"), "age": age})
-    return {"items": items}
+    return jsonify({"items": items})
 
 
-class ApproveIn(BaseModel):
-    tid: str
+@app.route("/api/approve", methods=["POST"])
+def approve():
+    if not _operator_ok():
+        return jsonify({"detail": "Unauthorized"}), 401
+    body = request.get_json(force=True, silent=True) or {}
+    tid = (body.get("tid") or "").strip()
+    with _lock:
+        _commands.append({"cmd": "approve", "arg": tid})
+    return jsonify({"ok": True})
 
 
-@app.post("/api/approve", dependencies=[Depends(require_operator)])
-def approve(body: ApproveIn):
-    with _cmd_lock:
-        _commands.append({"cmd": "approve", "arg": body.tid.strip()})
-    return {"ok": True}
-
-
-@app.post("/api/refresh-pending", dependencies=[Depends(require_operator)])
+@app.route("/api/refresh-pending", methods=["POST"])
 def refresh():
-    with _cmd_lock:
+    if not _operator_ok():
+        return jsonify({"detail": "Unauthorized"}), 401
+    with _lock:
         _commands.append({"cmd": "refresh", "arg": None})
-    return {"ok": True}
+    return jsonify({"ok": True})
 
 
-@app.post("/api/ticket-check", dependencies=[Depends(require_operator)])
+@app.route("/api/ticket-check", methods=["POST"])
 def ticket():
-    with _cmd_lock:
+    if not _operator_ok():
+        return jsonify({"detail": "Unauthorized"}), 401
+    with _lock:
         _commands.append({"cmd": "ticket_check", "arg": None})
-    return {"ok": True}
+    return jsonify({"ok": True})
 
 
-# ---------------------------------------------------------------------------
-# Bot-facing endpoints (separate secret, not the dashboard password)
-# ---------------------------------------------------------------------------
-@app.post("/api/bot/push", dependencies=[Depends(require_bot)])
-def bot_push(snapshot: dict):
+# ---- bot endpoints ----
+@app.route("/api/bot/push", methods=["POST"])
+def bot_push():
+    if not _bot_ok():
+        return jsonify({"detail": "Unauthorized bot"}), 401
+    snapshot = request.get_json(force=True, silent=True) or {}
     save_snapshot(snapshot)
-    return {"ok": True}
+    return jsonify({"ok": True})
 
 
-@app.get("/api/bot/commands", dependencies=[Depends(require_bot)])
+@app.route("/api/bot/commands", methods=["GET"])
 def bot_pull_commands():
-    with _cmd_lock:
+    if not _bot_ok():
+        return jsonify({"detail": "Unauthorized bot"}), 401
+    with _lock:
         drained, _commands[:] = list(_commands), []
-    return {"commands": drained}
+    return jsonify({"commands": drained})
 
 
-@app.get("/")
+@app.route("/", methods=["GET"])
 def root():
-    return {"ok": True, "service": "finops-relay"}
+    return jsonify({"ok": True, "service": "finops-relay"})
+
+
+# PythonAnywhere's WSGI config file expects a module-level `application`.
+application = app
+
+if __name__ == "__main__":
+    app.run(port=9000, debug=True)
